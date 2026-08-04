@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dpp-api
+  labels:
+    app: dpp-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dpp-api
+  template:
+    metadata:
+      labels:
+        app: dpp-api
+    spec:
+      serviceAccountName: dpp-api-sa
+      containers:
+        - name: dpp-api
+          image: 399078540634.dkr.ecr.us-west-1.amazonaws.com/dpp-api:latest
+          ports:
+            - containerPort: 8000
+          env:
+            - name: DB_HOST
+              value: "dpp-db.crc8i0qcuzva.us-west-1.rds.amazonaws.com"
+            - name: DB_NAME
+              value: "dpp"
+            - name: DB_USER
+              value: "postgres"
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: dpp-db-secret
+                  key: DB_PASSWORD
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "250m"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dpp-api-service
+spec:
+  type: ClusterIP
+  selector:
+    app: dpp-api
+  ports:
+    - port: 80
+      targetPort: 8000

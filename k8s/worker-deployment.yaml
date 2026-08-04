@@ -1,0 +1,53 @@
+# The dpp-db-secret referenced below is intentionally NOT defined here — a
+# database password does not belong in version control. Create it once per
+# cluster before applying these manifests, using the same value passed to
+# Terraform as var.db_password:
+#
+#   kubectl create secret generic dpp-db-secret \
+#     --from-literal=DB_PASSWORD='<your-db-password>'
+#
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dpp-worker
+  labels:
+    app: dpp-worker
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: dpp-worker
+  template:
+    metadata:
+      labels:
+        app: dpp-worker
+    spec:
+      serviceAccountName: dpp-worker-sa
+      containers:
+        - name: dpp-worker
+          image: 399078540634.dkr.ecr.us-west-1.amazonaws.com/dpp-worker:latest
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: SQS_QUEUE_URL
+              value: "https://sqs.us-west-1.amazonaws.com/399078540634/dpp-queue"
+            - name: DB_HOST
+              value: "dpp-db.crc8i0qcuzva.us-west-1.rds.amazonaws.com"
+            - name: DB_NAME
+              value: "dpp"
+            - name: DB_USER
+              value: "postgres"
+            - name: AWS_REGION
+              value: "us-west-1"
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: dpp-db-secret
+                  key: DB_PASSWORD
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "250m"
+              memory: "512Mi"

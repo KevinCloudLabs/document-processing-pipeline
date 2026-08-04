@@ -1,0 +1,28 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: dpp-worker-scaler
+spec:
+  scaleTargetRef:
+    name: dpp-worker
+  minReplicaCount: 0
+  maxReplicaCount: 5
+  cooldownPeriod: 60
+  pollingInterval: 15
+  triggers:
+    - type: aws-sqs-queue
+      authenticationRef:
+        name: dpp-sqs-trigger-auth
+      metadata:
+        queueURL: "https://sqs.us-west-1.amazonaws.com/399078540634/dpp-queue"
+        queueLength: "1"
+        awsRegion: "us-west-1"
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: dpp-sqs-trigger-auth
+spec:
+  podIdentity:
+    provider: aws
+    identityOwner: keda
