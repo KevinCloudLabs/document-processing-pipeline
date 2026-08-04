@@ -1,14 +1,14 @@
-# 📄 AWS Document Processing Pipeline — EKS & Event-Driven Autoscaling
+# 📄 AWS Document Processing Pipeline on Amazon EKS
 
 An event-driven document processing pipeline built on Amazon EKS. A user uploads a PDF to S3, which fires an SQS message. KEDA (Kubernetes Event Driven Autoscaling) watches queue depth and scales worker pods from 0 to 5 based on demand. A worker pod pulls the message, calls AWS Textract to extract text, tables, and key-value pairs from the document, and writes the results to RDS PostgreSQL. A separate, always-on REST API (Flask) reads from RDS and serves the processed data over JSON — no frontend, API-only by design.
 
 I built this as my first Kubernetes/EKS project to prove out patterns that ECS Fargate can't replicate: pod autoscaling driven directly by an external event source (queue depth, not CPU/memory), and fine-grained per-workload AWS permissions via IRSA rather than one task role per service. Everything scales to zero when idle — no workers running, no compute cost, until a document actually shows up.
 
+![Architecture Diagram](screenshots/architecture.png)
+
 ---
 
 ## 🏗️ Architecture
-
-![Architecture Diagram](screenshots/architecture.png)
 
 ### Why EKS + KEDA over ECS Fargate
 
@@ -58,7 +58,7 @@ KEDA needs to poll SQS `GetQueueAttributes` to know the current queue depth, but
 
 **NAT Gateway for egress, no VPC endpoints**
 
-S3, SQS, Textract, and ECR are all public AWS endpoints, so every call from a private-subnet pod egresses through the NAT Gateway. VPC endpoints would keep that traffic off the NAT entirely — the S3 *Gateway* endpoint is free and would be the first thing I'd add in production, since it removes NAT data-processing charges on every PDF download. The other three need *Interface* endpoints at roughly $7–8/month each per AZ, which across 2 AZs costs more than the NAT itself at this traffic volume. Documenting the tradeoff rather than reflexively adding endpoints.
+S3, SQS, Textract, and ECR are all public AWS endpoints, so every call from a private-subnet pod egresses through the NAT Gateway. VPC endpoints would keep that traffic off the NAT entirely — the S3 *Gateway* endpoint is free and would be the first thing I'd add in production, since it removes NAT data-processing charges on every PDF download. The other three need *Interface* endpoints at roughly $7–8/month each per AZ, which across 2 AZs costs more than the NAT itself at this traffic volume. I intentionally kept the architecture simple for this project and documented the tradeoff instead of adding VPC endpoints that would increase cost without providing meaningful benefit at this scale.
 
 **Hand-written Terraform resources instead of community modules**
 
@@ -72,125 +72,39 @@ I considered `terraform-aws-modules/eks/aws` and similar, but the point of this 
 aws-document-processing-pipeline/
 ├── .github/
 │   └── workflows/
-│       └── deploy-images.yml    # OIDC-authenticated build, push, and rollout
+│       └── deploy-images.yml      # OIDC build, push, and rollout
 ├── infra/
 │   ├── main.tf
 │   ├── variables.tf
 │   ├── outputs.tf
 │   ├── backend.tf
 │   └── modules/
-│       ├── networking/     # VPC, subnets, IGW, NAT Gateway, route tables
-│       ├── storage/        # S3 bucket, SQS queue, event notification
-│       ├── database/       # RDS PostgreSQL, security group, subnet group
-│       ├── ecr/             # Worker and API image repositories
-│       ├── eks/              # EKS Auto Mode cluster, cluster/node IAM roles, OIDC provider
-│       ├── iam/               # IRSA roles for the worker pod and the KEDA operator
-│       └── cicd/               # GitHub Actions OIDC deploy role + EKS access entry
+│       ├── networking/            # VPC, subnets, NAT Gateway
+│       ├── storage/               # S3, SQS
+│       ├── database/              # PostgreSQL
+│       ├── ecr/                   # Container registries
+│       ├── eks/                   # EKS Auto Mode cluster
+│       ├── iam/                   # IRSA roles
+│       └── cicd/                  # GitHub Actions resources
 ├── k8s/
-│   ├── service-accounts.yaml     # IRSA-annotated ServiceAccounts
-│   ├── worker-deployment.yaml    # Worker Deployment (replicas: 0, KEDA-controlled)
-│   ├── worker-scaledobject.yaml  # KEDA ScaledObject + TriggerAuthentication
-│   └── api-deployment.yaml       # Always-on API Deployment + Service
+│   ├── service-accounts.yaml      # IRSA-annotated ServiceAccounts
+│   ├── worker-deployment.yaml     # Worker Deployment (KEDA-controlled)
+│   ├── worker-scaledobject.yaml   # ScaledObject + TriggerAuthentication
+│   └── api-deployment.yaml        # API Deployment + Service
 ├── services/
-│   ├── processor/    # Worker: polls SQS, calls Textract, writes to RDS
+│   ├── processor/                 # Worker: SQS → Textract → RDS
 │   │   ├── app.py
 │   │   ├── requirements.txt
 │   │   └── Dockerfile
-│   └── api/            # REST API: reads from RDS, serves JSON
+│   └── api/                       # REST API: RDS → JSON
 │       ├── app.py
 │       ├── requirements.txt
 │       └── Dockerfile
 ├── docs/
-│   └── architecture.drawio   # editable source for the architecture diagram
+│   └── architecture.drawio        # Editable diagram source
 ├── screenshots/
 └── .gitignore
 ```
-
----
-
-## 🚀 Deploying
-
-```bash
-# 1. Provision infrastructure
-cd infra
-terraform init
-terraform apply          # requires db_password and github_repo in terraform.tfvars
-
-# 2. Grant your IAM principal cluster access (see Challenges — not automatic)
-aws eks create-access-entry --cluster-name dpp-cluster --principal-arn <your-iam-arn>
-aws eks associate-access-policy --cluster-name dpp-cluster --principal-arn <your-iam-arn> \
-  --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy \
-  --access-scope type=cluster
-
-aws eks update-kubeconfig --region us-west-1 --name dpp-cluster
-
-# 3. Install KEDA, annotated with its own IRSA role
-helm repo add kedacore https://kedacore.github.io/charts && helm repo update
-helm install keda kedacore/keda --namespace keda --create-namespace \
-  --set podIdentity.aws.irsa.enabled=true \
-  --set serviceAccount.operator.annotations."eks\.amazonaws\.com/role-arn"="$(terraform -chdir=infra output -raw keda_operator_role_arn)"
-
-# 4. Create the DB secret (never committed — see k8s/worker-deployment.yaml)
-kubectl create secret generic dpp-db-secret --from-literal=DB_PASSWORD='<your-db-password>'
-
-# 5. Create the documents table
-#    (schema in services/processor — connect via a pod, RDS is private)
-
-# 6. Apply application manifests
-kubectl apply -f k8s/
-```
-
-Image builds and rollouts are handled by the GitHub Actions pipeline — see CI/CD below.
-
----
-
-## ✅ Validation — End-to-End Pipeline
-
-A PDF uploaded to S3 flows through the entire pipeline automatically: S3 event → SQS message → KEDA scales the worker deployment up from 0 → Textract extracts text and key-value pairs → results written to RDS → readable via the REST API.
-
-### PDF Upload Triggering the Pipeline
-![S3 Upload](screenshots/s3-upload.png)
-
-### KEDA Scaling the Worker Deployment 0 → 5
-![KEDA Scaling](screenshots/keda-scaling.png)
-
-Uploading a batch of documents drives the queue depth up and KEDA scales the worker deployment to its `maxReplicaCount` of 5.
-
-### Worker Logs — Textract Processing
-![Worker Logs](screenshots/worker-logs.png)
-
-### API Response — Processed Document
-![API Response](screenshots/api-response.png)
-
-### Worker Scaling Back to 0 After Cooldown
-![Scale to Zero](screenshots/scale-to-zero.png)
-
----
-
-## 🌍 Infrastructure
-
-### EKS Cluster
-![EKS Cluster](screenshots/eks-cluster.png)
-
-### KEDA ScaledObject
-![ScaledObject](screenshots/scaledobject.png)
-
-### RDS Instance
-![RDS Instance](screenshots/rds-instance.png)
-
-### ECR Repositories
-![ECR Repositories](screenshots/ecr-repos.png)
-
-### IAM Roles — IRSA
-![IAM Roles](screenshots/iam-roles.png)
-
-### VPC & Networking
-![VPC Resource Map](screenshots/vpc-resource-map.png)
-
-### Terraform — State Matches Configuration
-![Terraform Plan](screenshots/terraform-apply.png)
-
-`terraform plan` against the live stack reports no drift — the deployed infrastructure matches what's committed.
 
 ---
 
@@ -218,17 +132,64 @@ Terraform itself runs locally — the pipeline owns application deployment only,
 
 ---
 
+## ✅ Validation — End-to-End Pipeline
+
+A PDF uploaded to S3 flows through the entire pipeline automatically: S3 event → SQS message → KEDA scales the worker deployment up from 0 → Textract extracts text and key-value pairs → results written to RDS → readable via the REST API.
+
+### PDF Upload Triggering the Pipeline
+![S3 Upload](screenshots/s3-upload.png)
+
+### KEDA Scaling the Worker Deployment 0 → 5
+![KEDA Scaling](screenshots/keda-scaling.png)
+
+Uploading a batch of documents drives the queue depth up and KEDA scales the worker deployment to its `maxReplicaCount` of 5.
+
+### Worker Logs — Textract Processing
+![Worker Logs](screenshots/worker-logs.png)
+
+### API Response — Processed Document
+![API Response](screenshots/api-response.png)
+
+### Worker Scaling Back to 0 After Cooldown
+![Scale to Zero](screenshots/scale-to-zero.png)
+
+---
+
+## 🌍 AWS Resources
+
+### EKS Cluster
+![EKS Cluster](screenshots/eks-cluster.png)
+
+### KEDA ScaledObject
+![ScaledObject](screenshots/scaledobject.png)
+
+### RDS Instance
+![RDS Instance](screenshots/rds-instance.png)
+
+### ECR Repositories
+![ECR Repositories](screenshots/ecr-repos.png)
+
+### IAM Roles — IRSA
+![IAM Roles](screenshots/iam-roles.png)
+
+### VPC & Networking
+![VPC Resource Map](screenshots/vpc-resource-map.png)
+
+### Terraform — State Matches Configuration
+![Terraform Plan](screenshots/terraform-apply.png)
+
+`terraform plan` against the live stack reports no drift — the deployed infrastructure matches what's committed.
+
+---
+
 ## 📚 What I Learned
 
 - IRSA: how EKS clusters act as OIDC identity providers, and how a Kubernetes ServiceAccount annotation lets a pod assume a scoped IAM role with zero static credentials
 - KEDA's ScaledObject/TriggerAuthentication pattern for scaling Kubernetes workloads off an external event source, including scale-to-zero
-- EKS Auto Mode's Terraform resource model — `compute_config`, `access_config`, the specific IAM policy set Auto Mode requires that a traditional managed node group doesn't
-- EKS access entries (API authentication mode) as the modern replacement for the `aws-auth` ConfigMap, and that cluster-creator admin access isn't granted automatically
-- Which Terraform attributes force resource replacement vs. update in place — and why reading a plan diff carefully matters more on stateful resources like an EKS cluster than on anything else
+- EKS Auto Mode's Terraform resource model — `compute_config`, `access_config`, the specific IAM policy set it requires — and EKS access entries as the modern replacement for the `aws-auth` ConfigMap
+- Terraform at a level beyond a single `main.tf`: real modules with explicit input/output contracts, which attribute changes force replacement rather than in-place updates, and when a resource shouldn't live in a project's state at all
 - GitHub Actions OIDC federation into AWS, and why the `sub` claim condition is the security boundary that makes it safe
-- When *not* to let Terraform manage a resource — account-wide shared resources like an OIDC provider don't belong in a single project's state
 - Textract's block-based response format and how to parse it into plain text, tables, and key-value pairs
-- Structuring Terraform as real reusable modules with explicit input/output contracts, rather than one flat `main.tf`
 - The boundary between what Terraform should own (infrastructure) and what `kubectl` should own (application state) in a Kubernetes-based AWS architecture
 
 ---
@@ -269,3 +230,9 @@ The interesting part came next. The obvious "proper" fix is `bootstrap_cluster_c
 **`aws_nat_gateway` doesn't take `vpc_id` or an `availability_mode` argument**
 
 An earlier draft of the networking module tried to configure the NAT Gateway as VPC-scoped rather than subnet-scoped, using arguments that don't exist on the resource. NAT gateways provision into a specific subnet — that's what determines their AZ — not the VPC directly. Fixed by pointing `subnet_id` at one of the public subnets.
+
+---
+
+## 🤖 AI Assistance
+
+AI was used throughout this project as a learning and productivity tool. I designed the AWS architecture, networking, IAM model, and the majority of the Terraform infrastructure myself. Claude primarily assisted with Kubernetes manifests, GitHub Actions CI/CD, and troubleshooting while I learned those technologies. Every generated change was reviewed, tested, and understood before being incorporated into the project.
